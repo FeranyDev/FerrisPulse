@@ -345,6 +345,35 @@
    - **能力位现状（据实记录）**：全项目**没有**「按设备禁用回报率操作」的接口——只有按设备类别 `btnRates[i].Visible = false` 的隐藏逻辑，以及仅作用于电竞回报率按钮的 `btnGameRates[i].Enabled = autoGameRateEnabled`；桌面回报率按钮对任何鼠标都恒可点，写入失败也**不做任何提示**。若后续要做“只读回报率设备”，必须新增能力位（例如 `MouseBatteryInfo.SupportsPollingRateWrite`）+ 一次成功的无操作写入探测，禁止在 UI 层凭品牌硬编码。
    - **回归锁定**：`tests/test_logitech_rate_badge_measured.ps1`（实测 1000 + 配置残留 500 → 徽标必须是 1000；实测缺失 → 回退 500 且不得出现 `0 Hz`；按钮高亮同步）。
 
+11. **回报率「可写能力位」三态机制（issue #35 落地）**：
+   - **模型**：`MouseBatteryInfo.SupportsPollingRateWrite` 为 `bool?`（`true` 可写 / `false` 固件拒绝 / `null` 未知）。
+   - **探测（一次性）**：`LogitechDeviceHelper.ProbePollingRateWriteNoOp()` 把**当前回报率原值**写回自身（no-op，绝不写其它值）；
+     - 收到成功应答（`rx[2] == featureIndex`）→ `true`；
+     - 收到 HID++ 错误帧（`rx[2] == 0xFF`）→ `false`（G304 实测 `11 01 FF 09 28 02`）；
+     - **无应答 / 超时 → `null`（未知）**，绝不可判成“不可写”，否则会把异步固件设备误伤成只读。
+   - **缓存**：结果按 `DeviceId` 存 `HKCU\Software\RazerBatteryTray\RateWriteCap`（`1`/`0`，值名把 `:` 换成 `_`）。**禁止每次轮询都探测**——探测本身是一次硬件写入。
+   - **自愈**：`SetLogitechPollingRate()` 收到错误帧即写缓存 `false`，写成功即写 `true`；UI 侧 `SetPollingRateFromUI()` 失败分支会重新解析能力并刷新按钮，所以“先探测不到、后来才发现”的设备也能自动置灰。
+   - **UI 策略（只在明确 `false` 时禁用）**：
+     - `RelayoutRateButtons()` 里 `btnRates[i].Enabled = (capability != false)`，并切换 `Cursor`；禁用时 tooltip 追加「该设备不支持修改回报率，当前档位由设备自身配置决定」；
+     - 齿轮按钮 `btnRateManage.Enabled` 同步（禁用后 WinForms 不再派发 Click，天然挡住回报率管理弹窗）；
+     - **电竞回报率一并锁死**：`UpdatePerformanceSection()` 在 `rateWriteBlocked` 时把运行期 `autoGameRateEnabled` 置 `false`，**且必须用 `isUpdatingUI` 包住 `chkAutoGameRate.Checked = false`**——否则 `CheckedChanged` 会走 `SetAutoGameRateEnabled(false)` 并 `SaveConfig()`，把“关闭”永久落盘，换回可写设备后用户的原偏好就丢了；
+       - **⚠️ 「全屏游戏自动优化」总开关是最大的旁路（实测概率复现）**：`SetAutoGameOptEnabled(true)` 旧实现无条件 `autoGameRateEnabled = true; chkAutoGameRate.Checked = true;`，只要用户点一下总开关（或刷新时 `chkAutoGameOpt.Checked = isOptExpanded` 触发 `CheckedChanged`），已锁死的「电竞回报率」就会被重新勾上。四条入口必须全部堵死：
+         1. `SetAutoGameOptEnabled(true)` 分支改为「只开 DPI」：`autoGameRateEnabled = !rateBlocked`，同时把 `chkAutoGameRate` / `autoGameRateToggleItem` 的 `Checked` 与 `Enabled` 一并复位；
+         2. 刷新时对 `chkAutoGameOpt.Checked` 的程序化赋值必须用 `isUpdatingUI` 包住，禁止触发 `CheckedChanged` 走总开关逻辑；
+         3. `SetAutoGameRateEnabled(true)` 顶部加兜底闸门（`if (enabled && IsPollingRateWriteBlocked()) enabled = false;`），拦住托盘菜单/代码调用等所有旁路；
+         4. 托盘菜单 `autoGameRateToggleItem.Enabled = !rateBlocked`（禁用后 WinForms 不再派发 Click），并补 `ToolTipText`。
+       - **验证方式**：`tests/test_polling_rate_write_capability.ps1` 里直接断言「开总开关后 `autoGameRateEnabled` 仍为 false、`chkAutoGameRate` 不勾选且不可编辑、电竞 DPI 正常开启」，另做 20 轮「刷新+总开关来回切」压测确认零异常。
+     - 电竞回报率开关 `chkAutoGameRate.Enabled = !rateLocked`，电竞档位按钮 `Enabled = autoGameRateEnabled && !rateLocked`；
+     - `SetPollingRateFromUI()` 顶部有前置闸门：`SupportsPollingRateWrite == false` 时直接弹一次托盘提示并 `return`，不发起任何写入；
+     - **未知（`null`）一律保持可点**，宁可在点击后由自愈机制置灰，也不要一上来就误伤。
+   - **⚠️ 置灰不能直接 `Enabled = false`（原生气泡会跟着失效）**：WinForms 的 `ToolTip.SetToolTip` 对 `Enabled == false` 的控件不弹（禁用控件收不到鼠标消息）。
+     - ❌ 反面写法（已废弃）：为了提示而手动 `toolTipTop.Show(text, ctl, x, y, 2600)` + 定时器。它会出现「固定驻留 2.6s、移开鼠标也不消失」的割裂体验，与项目原生 `SetToolTip` 的「悬停出现 / 移开即消失」语义完全不同。
+     - ✅ 正确写法：`ModernSegmentButton` 增加 **`IsReadOnly` 只读态** —— 绘制与 hover 完全等同禁用（灰化、无 hover 高亮），但控件保持 `Enabled = true`，于是**原生 ToolTip 按原有逻辑工作**，点击仍会派发并由业务闸门拦截（`SetPollingRateFromUI` 顶部前置闸门 + 托盘气泡）。
+     - **状态收敛**：`btnGameRates` 的可用性必须统一走 `ApplyGameRateButtonState()` 一处，否则 `UpdatePollingRateDisplayStates()` 里残留的 `Enabled = autoGameRateEnabled` 会把只读态覆盖掉（实测电竞按钮因此一度变回 `Enabled=false`）。
+     - **回归锁死**：测试需同时断言 `IsReadOnly == true` 且 `Enabled == true`（后者保证气泡可弹），不能只断言“不可点”。
+   - **范围收敛**：目前仅 Logitech 做探测（`ResolvePollingRateWriteCapability()` 决定取哪个来源）；其它品牌保持 `null`，等各自 Helper 补探测后再接。
+   - **回归锁定**：`tests/test_polling_rate_write_capability.ps1`（能力位三态类型、缓存三态读写、不可写全置灰、电竞回报率锁死为关闭且不可编辑、常规/电竞档位与开关气泡提示、可写恢复可点、不可写点击被拦截且不污染 `desktopPollingRate`）。
+
 ---
 
 ## 4. 版本发布标准作业程序 (Release SOP)

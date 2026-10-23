@@ -29,6 +29,108 @@ public static class LogitechDeviceHelper
     private static readonly object hidLock = new object();
     private const string CacheRegistryKey = @"Software\RazerBatteryTray\LogitechCache";
 
+    // 回报率写入能力缓存（按 DeviceId 存 DWord：1=可写，0=固件拒绝，无值=未知）。
+    // 之所以要缓存：能力探测本身要写一次硬件，绝不能每次轮询都重复探测。
+    private const string RateWriteCapRegistryKey = @"Software\RazerBatteryTray\RateWriteCap";
+
+    private static string RateCapValueName(string deviceId)
+    {
+        if (string.IsNullOrEmpty(deviceId)) return "";
+        return deviceId.Replace(':', '_').Replace('\\', '_').Replace('/', '_');
+    }
+
+    public static bool? GetPollingRateWriteCapability(string deviceId)
+    {
+        if (string.IsNullOrEmpty(deviceId)) return null;
+        try
+        {
+            using (RegistryKey key = Registry.CurrentUser.OpenSubKey(RateWriteCapRegistryKey, false))
+            {
+                if (key == null) return null;
+                object val = key.GetValue(RateCapValueName(deviceId));
+                if (val is int)
+                {
+                    if ((int)val == 1) return true;
+                    if ((int)val == 0) return false;
+                }
+                return null;
+            }
+        }
+        catch { return null; }
+    }
+
+    public static void SetPollingRateWriteCapability(string deviceId, bool writable)
+    {
+        if (string.IsNullOrEmpty(deviceId)) return;
+        try
+        {
+            using (RegistryKey key = Registry.CurrentUser.CreateSubKey(RateWriteCapRegistryKey))
+            {
+                if (key != null) key.SetValue(RateCapValueName(deviceId), writable ? 1 : 0, RegistryValueKind.DWord);
+            }
+        }
+        catch { }
+    }
+
+    // 一次性 no-op 探测：把「当前回报率原值」写回自身，观察设备是否接受。
+    //   - 收到成功应答（rx[2]==featureIndex）→ true（可写）
+    //   - 收到 HID++ 错误帧（rx[2]==0xFF）  → false（固件拒绝，例如 G304 对 0x8060 Func2 回错误码 0x02）
+    //   - 无应答 / 超时                      → null（未知，UI 保持可点，绝不误判为不可写）
+    // 严禁写非当前值，避免改坏用户配置。
+    private static bool? ProbePollingRateWriteNoOp(IntPtr handle, IntPtr hEvent, int inLen, byte devIdx, byte rateFeatIdx, byte extRateFeatIdx, int currentHz)
+    {
+        if (currentHz <= 0) return null;
+        try
+        {
+            if (extRateFeatIdx > 0)
+            {
+                byte rateIdx;
+                if (currentHz >= 8000) rateIdx = 6;
+                else if (currentHz >= 4000) rateIdx = 5;
+                else if (currentHz >= 2000) rateIdx = 4;
+                else if (currentHz >= 1000) rateIdx = 3;
+                else if (currentHz >= 500) rateIdx = 2;
+                else if (currentHz >= 250) rateIdx = 1;
+                else rateIdx = 0;
+
+                byte[] tx = new byte[20];
+                tx[0] = 0x11;
+                tx[1] = devIdx;
+                tx[2] = extRateFeatIdx;
+                tx[3] = 0x30; // Func 3: Set report rate
+                tx[4] = rateIdx;
+
+                byte[] rx = SendAndReceive(handle, hEvent, tx, inLen, 400);
+                if (rx != null && rx.Length >= 3 && rx[2] == extRateFeatIdx) return true;
+                if (rx != null && rx.Length >= 3 && rx[2] == 0xFF) return false;
+                return null;
+            }
+
+            if (rateFeatIdx > 0)
+            {
+                byte msInterval;
+                if (currentHz >= 1000) msInterval = 1;
+                else if (currentHz >= 500) msInterval = 2;
+                else if (currentHz >= 250) msInterval = 4;
+                else msInterval = 8;
+
+                byte[] tx = new byte[20];
+                tx[0] = 0x11;
+                tx[1] = devIdx;
+                tx[2] = rateFeatIdx;
+                tx[3] = 0x20; // Func 2: Set report rate
+                tx[4] = msInterval;
+
+                byte[] rx = SendAndReceive(handle, hEvent, tx, inLen, 400);
+                if (rx != null && rx.Length >= 3 && rx[2] == rateFeatIdx) return true;
+                if (rx != null && rx.Length >= 3 && rx[2] == 0xFF) return false;
+                return null;
+            }
+            return null;
+        }
+        catch { return null; }
+    }
+
     [StructLayout(LayoutKind.Sequential)]
     private struct OVERLAPPED
     {
@@ -1242,6 +1344,15 @@ public static class LogitechDeviceHelper
                                 DeviceCategory cat = DetectCategory(detectedPid, finalName);
                                 string deviceId = "Logitech:" + foundVid.ToString("X4") + ":" + detectedPid.ToString("X4") + (devIdx != 0xFF ? (":" + devIdx) : "");
 
+                                // 回报率写入能力（三态）：优先读缓存；缓存缺失时做一次 no-op 探测并落盘。
+                                // 探测只写回「当前回报率原值」，不会改变用户配置；超时/无应答一律记为未知。
+                                bool? rateWritable = GetPollingRateWriteCapability(deviceId);
+                                if (!rateWritable.HasValue && deviceOnline && detectedRate > 0 && (rateFeatIdx > 0 || extRateFeatIdx > 0))
+                                {
+                                    rateWritable = ProbePollingRateWriteNoOp(handle, hEvent, bestEndpoint.InputReportByteLength, devIdx, rateFeatIdx, extRateFeatIdx, detectedRate);
+                                    if (rateWritable.HasValue) SetPollingRateWriteCapability(deviceId, rateWritable.Value);
+                                }
+
                                 if (deviceOnline)
                                 {
                                     LogitechEndpoint ep = new LogitechEndpoint
@@ -1313,7 +1424,8 @@ public static class LogitechDeviceHelper
                                         DpiStages = stageTable,
                                         DpiStagesY = stageTable,
                                         PollingRate = finalRate,
-                                        SupportedPollingRates = supportedRates
+                                        SupportedPollingRates = supportedRates,
+                                        SupportsPollingRateWrite = rateWritable
                                     };
 
                                     if (deviceOnline)
@@ -1521,6 +1633,11 @@ public static class LogitechDeviceHelper
                     {
                         success = true;
                     }
+                    else if (rx != null && rx.Length >= 3 && rx[2] == 0xFF)
+                    {
+                        // 固件明确拒绝（HID++ 错误帧）→ 记录「不可写」，让 UI 置灰
+                        SetPollingRateWriteCapability(ep.DeviceId, false);
+                    }
                 }
 
                 // 2. Fallback to Feature 0x8060 (Standard Adjustable Report Rate)
@@ -1544,12 +1661,17 @@ public static class LogitechDeviceHelper
                     {
                         success = true;
                     }
+                    else if (rx != null && rx.Length >= 3 && rx[2] == 0xFF)
+                    {
+                        SetPollingRateWriteCapability(ep.DeviceId, false);
+                    }
                 }
 
                 if (success)
                 {
                     ep.PollingRate = hz;
                     CachedPollingRate = hz;
+                    SetPollingRateWriteCapability(ep.DeviceId, true);
                     SaveHardwareCache();
                 }
 
