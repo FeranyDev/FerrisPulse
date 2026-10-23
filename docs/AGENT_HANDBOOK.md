@@ -1,4 +1,4 @@
-﻿﻿# 📘 FerrisPulse · 灵脉 智能体实战操作与接力维护手册 (Agent Operational Handbook)
+﻿# 📘 FerrisPulse · 灵脉 智能体实战操作与接力维护手册 (Agent Operational Handbook)
 
 > **致所有接手本项目的 AI Agent 伙伴**：  
 > 本手册凝聚了前序 Agent 在开发、重构、调试、测试与发布全生命周期中积累的全部实战经验与踩坑教训。  
@@ -20,6 +20,8 @@
    - 3.8 社区开源贡献与代码署名礼仪
    - 3.9 新品牌 HID 适配实战（飞智 GPA6 / 迈从 G87 V2）
    - 3.10 社区硬件协议逆向实战（索尼 INZONE / 罗技 G502X / 怒喵 RACE / ATK 8K / 元派 P1）
+   - 3.11 无线电竞耳机协议突破（赛睿 Nova 5 / 雷蛇旋风黑鲨 / 罗技 G PRO X）
+   - 3.12 罗技 LIGHTSPEED 接收器 (046D:C53F) / G304·G305 适配实战（含虚拟 HID 甄别铁律）
 4. [版本发布标准作业程序 (Release SOP)](#4-版本发布标准作业程序-release-sop)
    - 4.1 云端标准流水线发布流程
    - 4.2 “发布后本地留旧测新”实战法则 (Local Test vs Remote Release SOP)
@@ -274,6 +276,74 @@
    - 该耳机不支持标准 HID++ `0x1000` / `0x1004` 特性，电量来自 HID++ 4.2 特性 `0x1F20 ADC_MEASUREMENT`。
    - 通信位于 `UsagePage 0xFF43`（20 字节短报文通道），先 Ping 根节点激活，再查询 `0x1F20` 特性索引，发送读取 ADC 指令，得到原始毫伏读数（`ra[4] << 8 | ra[5]`，范围在 2500mV ~ 4300mV 之间）。
    - 通过 12 阶高精度锂电池开路放电电压曲线（3500mV 对应 0%，4200mV 对应 100%）实施分段线性插值计算，精准映射出 0%~100% 百分比。
+
+---
+
+### 3.12 罗技 LIGHTSPEED 接收器 (`046D:C53F`) / G304·G305 适配实战（含虚拟 HID 甄别铁律）
+
+> 本节由 2026-10 实机适配沉淀：接收器 `046D:C53F` 后挂 G304/G305 鼠标（HID++ 2.0，devIdx `0x01`）。
+> **切勿因“设备已被 DeviceManager 列出”就跳过逆向**——本机型曾因 DPI 读错函数而长期谎报 200 DPI。
+
+1. **接收器端点拓扑（只有 20 字节集合说 HID++ 2.0）**：
+   - `MI_02` 同时暴露三个 Vendor 集合：`0xFF00/0x0001`（7 字节）、`0xFF00/0x0002`（20 字节）、`0xFF00/0x0004`（32 字节）。
+   - **仅 20 字节集合（Report ID `0x11`）可正常收发**；7 字节集合只回 HID++ 1.0 错误帧（`10 <dev> 8F ...`），32 字节集合 `WriteFile` 直接返回 `ERROR_INVALID_PARAMETER (87)`。端点优选逻辑必须优先 20 字节长集合。
+   - 配对设备挂在 **devIdx `0x01`** 上作答；`0x02` 返回错误帧，`0x03~0x06` 完全静默。`0xFF`（接收器本体）对本固件不应答，禁止把它当作“设备离线”判据。
+
+2. **⚠️ HID++ 2.0 特性 `0x2201` 读写函数号差一位（血泪根因）**：
+   - `Func 1 (0x18)` = **getSensorDpiList**（受支持档位列表，列表首项常为 `0x00C8`=200）；
+   - `Func 2 (0x28)` = **getSensorDpi**（当前生效 DPI）；`Func 3 (0x30)` = setSensorDpi。
+   - 旧实现把 Func 1 的列表首项当当前 DPI，导致实测 **3200 DPI 全程显示 200 DPI**，且 UI/OSD/游戏切换全链路跟着错。
+   - 实测原始帧（featIdx `0x1A`）：`11 01 1A 28 00 0C 80 03 20 00 …` → `[4]`=sensor 0、`[5..6]`=`0x0C80`=3200 当前 DPI、`[7..8]`=`0x0320`=800 出厂默认。
+   - 解析统一收敛到 `LogitechDeviceHelper.ParseAdjustableDpiReply()`，量程外/错误帧一律返回 `-1` 交缓存兜底，**严禁把列表首项伪装成实测 DPI**。
+
+3. **`0x1000` BATTERY_STATUS 是 G304 的正确电量通道（`0x1004`/`0x1001` 均不存在）**：
+   - `Func 0` 应答 `11 01 05 08 <level> <nextLevel> <status>`：实测 `5A 32 00` → 90%、下次上报阈值 50%、`status=0` 放电中。
+   - G304/G305 为 **AA 干电池供电**，不存在充电状态，`IsCharging` 必须恒 `false`，严禁把 `status` 非 1 误判为“正在充电”。
+
+4. **`0x8060` 回报率：可读不可写（必须诚实失败）**：
+   - `Func 0` = getReportRateList 位图（实测 `0x8B`）；`Func 1` = getReportRate，单位为毫秒（实测 `01` → 1000Hz）。
+   - `Func 2` = setReportRate，但本固件对任意取值（0/1/2/4/8）均返回 HID++ 错误帧 `11 01 FF 09 28 02 …`（错误码 `0x02`）；`Func 3~6` 返回错误码 `0x07`（函数不存在）。
+   - 结论：G304 的回报率由**板载配置文件扇区（`0x8100`）**管理，HID++ 直写不可行。`SetLogitechPollingRate` 应以“未收到成功应答即返回 `false`”收场，UI 按失败提示，**绝不允许回写缓存伪造已切换**。
+
+5. **`0x2202`（XY 独立双轴）在 G304 上不存在**：`IsXyIndependent` 必须为 `false`，UI 不得展示双轴输入框。
+
+6. **机型名分片读取（长名截断陷阱）**：
+   - `0x0005` 特性 `getName` 每次最多回 16 字节（20 字节报告减去 4 字节头）。只取 offset `0` 会把 37 字符全名砍成 `G304 Lightspeed`。
+   - 必须按 `nameOff += 16` 循环拉取，遇到 `0x00` 或读满 `nameLen` 收尾。
+
+7. **🔴 虚拟 HID 甄别铁律（一个接收器环境里最容易误判的坑）**：
+   - 本机同时存在 `HID\LINKLOOK&COLxx`（`BACD:001F`）、`HID\GVINPUT&COLxx`（`00FF:BACC`，NetEase 模拟器）、`HID\{GUID}&COLxx`（`BE27:F2E5`，Clixon `ClxVirtHid`）等节点，产品名一律伪装成 `Virtual Multitouch Device` / 键盘鼠标组合，甚至带 65 字节 `0xFF00` Vendor 集合。
+   - **判定方法**：查询 `DEVPKEY_Device_Parent`，父实例以 `ROOT\HIDCLASS\` 开头即为软件虚拟节点（仿真器/映射工具/远程控制），而非物理外设。
+   - **处置**：一律排除，绝不为其编写电量/DPI 协议——它们没有物理电池，硬适配只会在 UI 里制造幽灵设备与伪造电量。物理外设必须能追溯到 `USB\VID_…` 或 `BTHENUM\…` 父设备。
+
+8. **`0x8100` 板载扇区只读访问（字节序陷阱 + G304 实测档位表）**：
+   - **函数表**（G HUB 静态分析，OpenLogi / Solaar 一致）：`fn0` GetOnboardProfilesInfo、`fn1` SetOnboardMode、`fn2` IsOnboardMode、`fn3` SetActiveProfile、`fn4` GetActiveProfile、`fn5` ReadData、`fn6` BeginWrite、`fn7` WriteData、`fn8` EndWrite、`fn9` ExecuteMacro、`fn10` GetCRC、`fn11`/`fn12` ActiveProfileResolution。
+   - **审计/取证只允许调用 `0/2/4/5/10`**；`fn1`/`fn3`/`fn6`/`fn7`/`fn8`/`fn9`/`fn12` 会改设备状态（切换模式、切配置、写扇区），禁止在“只读排查”里盲扫函数号。
+   - 🔴 **参数字节序陷阱（最容易误判成“不支持”）**：扇区号按 **u16 小端**（p0=低字节、p1=高字节），偏移按 **u16 大端**（p2=高、p3=低）。实测 `(01,00,00,00)` = 扇区 `0x0001` 偏移 0 → 成功；照搬 Solaar 的 `(hi,lo)` 传 `(00,01,…)` 则一律收到 HID++ 错误帧 `11 01 FF 07 58 02`（错误码 `0x02` = INVALID_ADDRESS），曾因此误判“该接收器不支持扇区读取”。
+   - **元数据（G304 实测）**：`memory=1`(flash)、`profileFormat=3`、`macroFormat=1`、`profiles=1`、`oob=1`、`buttons=6`、`sectors=6`、`sectorSize=255`、`flags=0x0A`；`isOnboardMode=1`、`activeProfile=1`。
+   - **可读扇区只有 `0x0001` 与 `0x0101`**：前者是按键映射（`…01 C1 00 xx` 条目 + 机型名尾串 `" Wireless Gaming Mouse"`），后者是指针/DPI 扇区；其余地址全部 INVALID_ADDRESS。
+   - **`0x0101` 布局（实测）**：`[0]=0x01 [1]=0x01 [2]=0x00`，`[3..12]` = **5 × u16 小端 DPI 档位**，实测 `400 / 800 / 1600 / 3200 / 0x0000（空槽）`；紧邻的 Y 轴槽位全 `0xFF`（G304 硬件无独立双轴，与 `0x2202` 缺失一致）。`[32..51]` 为 5 组 4 字节条目（`0x0180` + 标志字节 `01/02/04/08/10`，语义未定，禁止臆造）。
+   - **末块读法**：255 字节扇区的最后 16 字节必须用 `offset = sectorSize - 16 = 239` 读取（按 16 对齐读到 240 会返回 INVALID_ADDRESS）。
+   - **结论**：G304 的板载档位是 **400/800/1600/3200 + 空槽**，`6400` 并不在设备真实档位表里（传感器能力上限仍是 12000）。因此 UI 里写死的 `400/800/1600/3200/6400` 五档与 `DpiStage=2` 都是通用假设值，不得当作“设备实测档位”向用户呈现。
+
+9. **⚠️ 档位号禁止硬编码（「点立即刷新就跳回 800」的根因与根治）**：
+   - **症状**：点「立即刷新」明明读到了真实 DPI（实测 3200），主界面档位高亮却总跳回第 2 档（800）。
+   - **根因**：`LogitechDeviceHelper` 构造 `MouseBatteryInfo` 时写死 `DpiStage = 2`、`DpiStageCount = 5`；而主界面高亮逻辑（`MainForm.Hardware.cs`）只要 `info.DpiStage > 0 && info.DpiStageCount > 0` 就直接用 `i == DpiStage - 1`，无条件信任该字段 → 无论实测多少 DPI，永远高亮索引 1（即 800）。
+   - **正确做法**：`DpiStage = MatchDpiStage(实测 DPI, 档位表)` —— ±50 容差内的精确命中优先，未命中取数值最接近的有效档位，空槽（`<= 0` 或 `0xFFFF`）必须跳过。
+   - **禁止返回 0**：`desktopDpiStage` / `RestoreDesktopDpiStage` 等“离开游戏还原档位”链路依赖 `DpiStage > 0`，返回 0 会把还原目标打回第 1 档（400），反而制造更隐蔽的 DPI 掉档。
+   - **连带影响（同一根因）**：硬编码 2 还会让「离开全屏游戏」把 DPI 还原成 800 而不是用户原来的 3200 —— 这类“只在游戏回来后才发现”的掉档，第一时间应先查 `DpiStage` 是否被写死。
+   - **回归锁定**：`tests/test_logitech_stage_from_dpi.ps1`（纯反射、不依赖硬件）同时断言 DPI→档位映射与 UI 高亮索引（3200 必须命中第 4 档、800 不得被选中）。
+
+10. **「硬件生效」徽标必须取实测值，禁止取配置期望值（回报率谎报根因）**：
+   - **症状**：右上角徽标显示 `● 硬件生效: 500 Hz`，但双击查询 `0x8060` Func1 实测是 `1000 Hz`。
+   - **根因（两段式污染）**：
+     1. `MainForm.SetPollingRateFromUI()` 旧实现在**下发硬件之前**就执行 `desktopPollingRate = hz; SaveConfig();`，一旦写入被拒（G304 固件对 `0x8060` Func2 一律回 `11 01 FF 09 28 02`），配置里就永久留下一个从未生效的“期望值”；
+     2. `UpdatePollingRateDisplayStates()` 的徽标与桌面档位高亮都拿 `desktopPollingRate` 做基准 → 于是 UI 长期显示假值，还顶着“硬件生效”四个字。
+   - **正确做法**：
+     - 写入路径改为「**写成功才认账**」：`desktopPollingRate = hz` 与 `SaveConfig()` 全部搬到 `ok == true` 分支内，失败时保持旧值，配置不再被污染。
+     - 徽标与桌面档位高亮改为「**实测优先、配置兜底**」：优先用 `selectedDevice.PollingRate`（设备实读），仅当实测为 0（读不到）时才回退 `desktopPollingRate`；电竞自动回报率生效期间仍用 `gamePollingRate`（那是本进程刚下发的值），桌面按钮高亮在此期间也仍按 `desktopPollingRate`。
+   - **能力位现状（据实记录）**：全项目**没有**「按设备禁用回报率操作」的接口——只有按设备类别 `btnRates[i].Visible = false` 的隐藏逻辑，以及仅作用于电竞回报率按钮的 `btnGameRates[i].Enabled = autoGameRateEnabled`；桌面回报率按钮对任何鼠标都恒可点，写入失败也**不做任何提示**。若后续要做“只读回报率设备”，必须新增能力位（例如 `MouseBatteryInfo.SupportsPollingRateWrite`）+ 一次成功的无操作写入探测，禁止在 UI 层凭品牌硬编码。
+   - **回归锁定**：`tests/test_logitech_rate_badge_measured.ps1`（实测 1000 + 配置残留 500 → 徽标必须是 1000；实测缺失 → 回退 500 且不得出现 `0 Hz`；按钮高亮同步）。
 
 ---
 

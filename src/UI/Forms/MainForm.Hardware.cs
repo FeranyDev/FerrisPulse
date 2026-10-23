@@ -596,9 +596,11 @@ namespace RazerBatteryTray
 
         public void SetPollingRateFromUI(int hz)
         {
-            desktopPollingRate = hz;
-            SaveConfig();
-
+            // ⚠️ 严禁在下发前就把 desktopPollingRate 改成目标值并落盘：
+            // 旧实现先 `desktopPollingRate = hz; SaveConfig();` 再写硬件，一旦硬件拒绝写入
+            // （例如 G304 固件对 0x8060 Func2 一律回错误码 0x02），配置与 UI 就会长期停在
+            // 一个从未生效的“期望值”上，而右上角还顶着“硬件生效”四个字骗用户。
+            // 现在改为「写成功才认账」：失败时保持旧值，UI 与实测保持一致。
             var curDev = selectedDevice;
             new Thread(() => {
                 bool ok = false;
@@ -637,12 +639,14 @@ namespace RazerBatteryTray
                 if (ok)
                 {
                     this.BeginInvoke(new Action(() => {
+                        desktopPollingRate = hz;
                         if (!isGamingActive && curDev != null) curDev.PollingRate = hz;
                         if (!isGamingActive && lastInfo != null && lastInfo.DeviceId == (curDev != null ? curDev.DeviceId : "")) lastInfo.PollingRate = hz;
 
                         UpdateDesktopRateButtonSelection(hz);
                         UpdatePollingRateDisplayStates();
                         UpdateStatusDisplay();
+                        SaveConfig();
                     }));
                 }
             }) { IsBackground = true }.Start();

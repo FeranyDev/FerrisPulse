@@ -2,7 +2,7 @@
 // 模块名称: LogitechDeviceHelper.cs
 // 所属区域: Hardware (硬件驱动层)
 // 核心职责:
-//   罗技 (Logitech) HID++ 1.0/2.0 私有协议通信、电量检测、DPI调节 (Feature 0x2201/0x2202 支持XY轴独立) 与回报率设置 (Feature 0x8060/0x8061 最高8000Hz) 实现
+//   罗技 (Logitech) HID++ 1.0/2.0 私有协议通信、电量检测、DPI调节 (Feature 0x2201/0x2202 支持XY轴独立) 与回报率设置 (Feature 0x8060/0x8061 最高8000Hz) 实现
 //   另含 G PRO X Wireless 耳机 (046D:0ABA) 专属 HID++ 4.2 电量通道 (Feature 0x1F20 ADC_MEASUREMENT)
 // 依赖关系: NativeMethods.cs, MouseBatteryInfo.cs
 //
@@ -409,7 +409,7 @@ public static class LogitechDeviceHelper
             case 0x409B: return "Logitech G PRO X 60 游戏键盘";
             case 0x4088: return "Logitech G733 LIGHTSPEED 耳机";
             case 0x4097: return "Logitech G PRO X 2 LIGHTSPEED 耳机";
-            case 0x408C:
+            case 0x408C:
             case 0x0ABA: return "Logitech G PRO X Wireless 游戏耳机";
             case 0x4085: return "Logitech G435 无线耳机";
             case 0x4080: return "Logitech G533 无线耳机";
@@ -429,6 +429,7 @@ public static class LogitechDeviceHelper
         }
 
         // Receiver defaults
+        if (pid == 0xC53F) return "Logitech LIGHTSPEED 无线接收器 (0xC53F)";
         if (pid == 0xC54F) return "Logitech G PRO X3 SUPERSTRIKE 8K 接收器";
         if (pid == 0xC547) return "Logitech Lightspeed 游戏无线接收器 (0xC547)";
         if (pid == 0xC548) return "Logitech G PRO X SUPERLIGHT 2 4K/8K 接收器";
@@ -705,14 +706,14 @@ public static class LogitechDeviceHelper
         }
         return null;
     }
-
+
     public static List<MouseBatteryInfo> QueryAllLogitechDevices()
     {
         lock (hidLock)
         {
             List<MouseBatteryInfo> results = new List<MouseBatteryInfo>();
-            List<LogitechRawEndpoint> rawEndpoints = new List<LogitechRawEndpoint>();
-
+            List<LogitechRawEndpoint> rawEndpoints = new List<LogitechRawEndpoint>();
+
             try
             {
                 MouseBatteryInfo headset = QueryLogitechProXHeadset();
@@ -958,27 +959,33 @@ public static class LogitechDeviceHelper
                                         if (rxNameCount != null && rxNameCount.Length >= 5 && rxNameCount[4] > 0)
                                         {
                                             int nameLen = rxNameCount[4];
-                                            byte[] txGetName = new byte[20];
-                                            txGetName[0] = 0x11;
-                                            txGetName[1] = devIdx;
-                                            txGetName[2] = nameFeatIdx;
-                                            txGetName[3] = 0x18; // Func 1: getName, swid 8
-                                            txGetName[4] = 0x00;
-                                            byte[] rxGetName = SendAndReceive(handle, hEvent, txGetName, bestEndpoint.InputReportByteLength, 250, bestEndpoint.OutputReportByteLength, devIdx, nameFeatIdx, 0x08);
-                                            if (rxGetName != null && rxGetName.Length > 4)
+                                            // ⚠️ getName (Func 1) 每次最多返回报告尾部 16 字节，必须按 16 字节步进分片拉取。
+                                            // 只取 offset 0 会把长机型名截断（如 G304 的 37 字符全名被砍成 "G304 Lightspeed"）。
+                                            StringBuilder nsb = new StringBuilder();
+                                            for (int nameOff = 0; nameOff < nameLen; nameOff += 16)
                                             {
-                                                StringBuilder nsb = new StringBuilder();
-                                                for (int c = 4; c < rxGetName.Length && (c - 4) < nameLen; c++)
+                                                byte[] txGetName = new byte[20];
+                                                txGetName[0] = 0x11;
+                                                txGetName[1] = devIdx;
+                                                txGetName[2] = nameFeatIdx;
+                                                txGetName[3] = 0x18; // Func 1: getName, swid 8
+                                                txGetName[4] = (byte)nameOff;
+                                                byte[] rxGetName = SendAndReceive(handle, hEvent, txGetName, bestEndpoint.InputReportByteLength, 250, bestEndpoint.OutputReportByteLength, devIdx, nameFeatIdx, 0x08);
+                                                if (rxGetName == null || rxGetName.Length < 5) break;
+
+                                                bool nameTerminated = false;
+                                                for (int c = 4; c < rxGetName.Length; c++)
                                                 {
-                                                    if (rxGetName[c] == 0) break;
+                                                    if (rxGetName[c] == 0) { nameTerminated = true; break; }
                                                     if (rxGetName[c] >= 32 && rxGetName[c] <= 126)
                                                     {
                                                         nsb.Append((char)rxGetName[c]);
                                                     }
                                                 }
-                                                string str = nsb.ToString().Trim();
-                                                if (str.Length > 2) detectedName = str;
+                                                if (nameTerminated) break;
                                             }
+                                            string str = nsb.ToString().Trim();
+                                            if (str.Length > 2) detectedName = str;
                                         }
                                     }
 
@@ -1149,20 +1156,20 @@ public static class LogitechDeviceHelper
                                         dpiFeatIdx = rxFeat2201[4];
                                         if (hardwareDpi <= 0)
                                         {
+                                            // ⚠️ 0x2201 只有 Func 2 (0x28 = getSensorDpi) 返回「当前生效 DPI」。
+                                            // Func 1 (0x18) 是 getSensorDpiList，返回受支持的档位列表（首字节常见 0x00C8=200），
+                                            // 误用会把实测 3200 DPI 的 G304/G305 读成 200 DPI，导致 UI 与 OSD 全程谎报。
                                             byte[] txGetDpi = new byte[20];
                                             txGetDpi[0] = 0x11;
                                             txGetDpi[1] = devIdx;
                                             txGetDpi[2] = dpiFeatIdx;
-                                            txGetDpi[3] = 0x18; // Func 1 (0x10) | swid 8
+                                            txGetDpi[3] = 0x28; // Func 2: getSensorDpi | swid 8
                                             txGetDpi[4] = 0x00; // Sensor 0
                                             byte[] rxGetDpi = SendAndReceive(handle, hEvent, txGetDpi, bestEndpoint.InputReportByteLength, 250, bestEndpoint.OutputReportByteLength, devIdx, dpiFeatIdx, 0x08);
-                                            if (rxGetDpi != null && rxGetDpi.Length >= 7)
+                                            int dVal = ParseAdjustableDpiReply(rxGetDpi);
+                                            if (dVal > 0)
                                             {
-                                                int dVal = (rxGetDpi[5] << 8) | rxGetDpi[6];
-                                                if (dVal >= 50 && dVal <= 50000)
-                                                {
-                                                    hardwareDpi = dVal;
-                                                }
+                                                hardwareDpi = dVal;
                                             }
                                         }
                                     }
@@ -1277,6 +1284,11 @@ public static class LogitechDeviceHelper
                                     int finalDpiY = (hardwareDpiY > 0) ? hardwareDpiY : finalDpiX;
                                     int finalRate = (detectedRate > 0) ? detectedRate : CachedPollingRate;
 
+                                    // ⚠️ 档位号必须由「实测 DPI」反推，绝不能写死常量。
+                                    // 旧实现硬编码 DpiStage = 2，导致实测 3200 DPI 时主界面每次刷新都把高亮
+                                    // 跳回第 2 档（800 DPI），与真实硬件状态完全脱节。
+                                    int[] stageTable = new int[] { 400, 800, 1600, 3200, 6400 };
+
                                     MouseBatteryInfo info = new MouseBatteryInfo
                                     {
                                         DeviceId = deviceId,
@@ -1296,10 +1308,10 @@ public static class LogitechDeviceHelper
                                         Dpi = finalDpiX,
                                         DpiY = finalDpiY,
                                         IsXyIndependent = (finalDpiY != finalDpiX),
-                                        DpiStage = 2,
-                                        DpiStageCount = 5,
-                                        DpiStages = new int[] { 400, 800, 1600, 3200, 6400 },
-                                        DpiStagesY = new int[] { 400, 800, 1600, 3200, 6400 },
+                                        DpiStage = MatchDpiStage(finalDpiX, stageTable),
+                                        DpiStageCount = stageTable.Length,
+                                        DpiStages = stageTable,
+                                        DpiStagesY = stageTable,
                                         PollingRate = finalRate,
                                         SupportedPollingRates = supportedRates
                                     };
@@ -1551,6 +1563,28 @@ public static class LogitechDeviceHelper
         }
     }
 
+    // ========================================================================
+    // HID++ 2.0 Feature 0x2201 (ADJUSTABLE_DPI) 应答解析
+    // Func 2 = getSensorDpi，应答布局（Report 0x11，20 字节）：
+    //   [0]=0x11 [1]=deviceIndex [2]=featureIndex [3]=0x28(func2|swid8)
+    //   [4]=sensorIndex [5..6]=当前 DPI (BE) [7..8]=出厂默认 DPI (BE)
+    // 实测 G304/G305（046D:C53F 接收器后 devIdx 1）：00 0C 80 03 20 -> 当前 0x0C80 = 3200，
+    // 默认 0x0320 = 800。Func 1 返回的是受支持档位列表，绝不可当当前 DPI 使用。
+    // 量程校验只过滤明显非法帧（错误帧 / 空帧 / 越界），未命中一律返回 -1 交由缓存兜底，
+    // 严禁把列表首项 200 之类数值伪装成真实 DPI。
+    // ========================================================================
+
+    public static int ParseAdjustableDpiReply(byte[] rx)
+    {
+        if (rx == null || rx.Length < 7) return -1;
+        if (rx[0] != 0x11 && rx[0] != 0x10) return -1;
+        if (rx[2] == 0xFF) return -1; // HID++ 错误帧
+
+        int dpi = (rx[5] << 8) | rx[6];
+        if (dpi < 200 || dpi > 26000) return -1;
+        return dpi;
+    }
+
     public static bool FastQueryDpi(out int curDpi, out int activeStage, out int stageCount, string targetDeviceId = null)
     {
         int dpiY;
@@ -1580,12 +1614,35 @@ public static class LogitechDeviceHelper
 
     private static int MatchDpiStage(int dpi)
     {
-        int[] standardStages = new int[] { 400, 800, 1600, 3200, 6400 };
-        for (int i = 0; i < standardStages.Length; i++)
+        return MatchDpiStage(dpi, new int[] { 400, 800, 1600, 3200, 6400 });
+    }
+
+    // 由「实测 DPI」反推当前生效档位（严禁再用硬编码常量）：
+    //   1) ±50 容差内的精确命中优先（吸收硬件上报抖动）；
+    //   2) 未命中则取数值最接近的有效档位，保证 UI 高亮不与真实速度脱节；
+    //   3) 空槽（<=0 或 0xFFFF）必须跳过 —— G304 板载档位表末位就是空槽。
+    // 返回值恒 >= 1：desktopDpiStage / 游戏切换还原链路依赖 DpiStage > 0，返回 0 会把还原档位打回第 1 档。
+    public static int MatchDpiStage(int dpi, int[] stages)
+    {
+        if (dpi <= 0) return 1;
+        if (stages == null || stages.Length == 0) return 1;
+
+        int bestStage = 1;
+        int bestDiff = int.MaxValue;
+        for (int i = 0; i < stages.Length; i++)
         {
-            if (Math.Abs(standardStages[i] - dpi) <= 50) return i + 1;
+            int val = stages[i];
+            if (val <= 0 || val > 60000) continue;
+
+            int diff = Math.Abs(val - dpi);
+            if (diff <= 50) return i + 1;
+            if (diff < bestDiff)
+            {
+                bestDiff = diff;
+                bestStage = i + 1;
+            }
         }
-        return 1;
+        return bestStage;
     }
 
     public static MouseBatteryInfo QueryLogitechDeviceInfo(string deviceFingerprint = null)

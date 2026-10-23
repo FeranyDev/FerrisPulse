@@ -1711,7 +1711,18 @@ namespace RazerBatteryTray
             }
 
             // 2. 右上角硬件生效徽标：保留并增加中间点显示 DPI，支持独立 X/Y 轴呈现
-            int currentActiveHz = (isGamingActive && autoGameRateEnabled) ? gamePollingRate : desktopPollingRate;
+            // ⚠️ “硬件生效”必须取「实测值」而不是「配置里的期望值」。
+            // 旧实现固定取 desktopPollingRate（配置值），当硬件拒绝写入回报率时（如 G304 固件
+            // 对 0x8060 Func2 回错误码 0x02），徽标会长期显示一个根本没生效的 Hz，属于谎报。
+            // 仅在「电竞回报率自动切换生效中」时保留 gamePollingRate（那是本进程刚刚下发的值），
+            // 其余情况优先采用 selectedDevice.PollingRate（来自设备实读）。
+            int measuredDesktopHz = (selectedDevice != null && selectedDevice.PollingRate > 0)
+                ? selectedDevice.PollingRate
+                : 0;
+            int effectiveDesktopHz = (measuredDesktopHz > 0) ? measuredDesktopHz : desktopPollingRate;
+            int currentActiveHz = (isGamingActive && autoGameRateEnabled) ? gamePollingRate : effectiveDesktopHz;
+            // 桌面档位按钮的高亮：电竞自动回报率生效期间设备实测值就是“电竞值”，此时仍按用户配置的桌面档高亮
+            int desktopHighlightRate = (isGamingActive && autoGameRateEnabled) ? desktopPollingRate : effectiveDesktopHz;
             int currentActiveDpi = 0;
             int currentActiveDpiY = 0;
             int activeStage = (isGamingActive && autoGameDpiEnabled)
@@ -1774,7 +1785,7 @@ namespace RazerBatteryTray
             {
                 if (btnRates[i] != null && pollingRateValues != null && i < pollingRateValues.Length)
                 {
-                    bool isSel = (pollingRateValues[i] == desktopPollingRate);
+                    bool isSel = (pollingRateValues[i] == desktopHighlightRate);
                     btnRates[i].Selected = isSel;
                     btnRates[i].IsPreset = (isSel && isGamingActive && autoGameRateEnabled);
                 }
